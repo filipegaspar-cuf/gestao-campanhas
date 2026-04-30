@@ -2,12 +2,14 @@ import streamlit as st
 import pandas as pd
 from databricks import sql as dbsql
 from databricks.sdk import WorkspaceClient
+import time
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 TABLE = "cufdwcatalog.db_analytic_dsi.campanhas"
 PAGE_SIZE = 50
+GENIE_SPACE_ID = "01f1328b6dd215b6ac5a9a09a3b90f38"
 
 # Column definitions (DB name -> display label)
 COLUMNS = [
@@ -54,7 +56,10 @@ def get_connection():
         http_path="/sql/1.0/warehouses/" + _get_warehouse_id(w),
         credentials_provider=lambda: w.config.authenticate,
     )
-
+    
+@st.cache_resource
+def get_workspace_client():
+    return WorkspaceClient()
 
 def _get_warehouse_id(w: WorkspaceClient) -> str:
     warehouses = list(w.warehouses.list())
@@ -130,6 +135,51 @@ def build_where_clause(record: dict) -> str:
             parts.append(f"{bq(c)} = {esc(str(val))}")
     return " AND ".join(parts)
 
+# ---------------------------------------------------------------------------
+# Genie Space helpers
+# ---------------------------------------------------------------------------
+
+def genie_ask(question: str) -> dict:
+    """Send a question to the Genie space and poll until complete."""
+    w = get_workspace_client()
+    # Start a new conversation
+    resp = w.genie.start_conversation(space_id=GENIE_SPACE_ID, content=question)
+    conversation_id = resp.conversation_id
+    message_id = resp.message_id
+
+    # Poll for completion
+    for _ in range(60):
+        msg = w.genie.get_message(
+            space_id=GENIE_SPACE_ID,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+        if msg.status.value in ("COMPLETED", "FAILED"):
+            break
+        time.sleep(2)
+
+    result = {"text": None, "df": None, "sql": None, "status": msg.status.value}
+
+    if msg.attachments:
+        for att in msg.attachments:
+            if att.text and att.text.content:
+                result["text"] = att.text.content
+            if att.query and att.query.query:
+                result["sql"] = att.query.query
+            if att.query and att.query.query:
+                try:
+                    qr = w.genie.get_message_query_result(
+                        space_id=GENIE_SPACE_ID,
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        attachment_id=att.id,
+                    )
+                    if qr.columns and qr.data_array:
+                        cols = [c.name for c in qr.columns]
+                        result["df"] = pd.DataFrame(qr.data_array, columns=cols)
+                except Exception:
+                    pass
+    return result
 
 # ---------------------------------------------------------------------------
 # UI
@@ -165,8 +215,9 @@ with st.sidebar:
                 st.error(f"Erro ao inserir: {e}")
 
 # ---------- Tabs ----------
-tab_list, tab_edit, tab_delete = st.tabs(["📋 Listagem", "✏️ Editar", "🗑️ Eliminar"])
-
+tab_list, tab_edit, tab_delete, tab_genie = st.tabs(
+    ["📋 Listagem", "✏️ Editar", "🗑️ Eliminar", "🤖 Assistente IA"]
+)
 # ---- TAB: Listagem ----
 with tab_list:
     col_search, col_refresh = st.columns([4, 1])
@@ -288,3 +339,63 @@ with tab_delete:
                     st.success("✅ Campanha eliminada com sucesso!")
                 except Exception as e:
                     st.error(f"Erro ao eliminar: {e}")
+                    
+# ---- TAB: Assistente IA (Genie) ----
+with tab_genie:
+    st.markdown(
+        "Faça perguntas em linguagem natural sobre as campanhas de marketing. "
+        "O assistente utiliza o espaço Genie para gerar respostas baseadas nos dados."
+    )
+
+    # Chat history in session state
+    if "genie_messages" not in st.session_state:
+        st.session_state.genie_messages = []
+
+    # Display chat history
+    for msg in st.session_state.genie_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg.get("df") is not None:
+                st.dataframe(msg["df"], use_container_width=True, hide_index=True)
+            if msg.get("sql"):
+                with st.expander("Ver SQL gerado"):
+                    st.code(msg["sql"], language="sql")
+
+    # Chat input
+    if prompt := st.chat_input("Pergunte algo sobre as campanhas..."):
+        st.session_state.genie_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("A consultar o Genie..."):
+                try:
+                    result = genie_ask(prompt)
+                    if result["status"] == "FAILED":
+                        response_text = "Não foi possível responder a esta pergunta. Tente reformular."
+                        st.warning(response_text)
+                    else:
+                        response_text = result["text"] or "Consulta executada com sucesso."
+                        st.markdown(response_text)
+                        if result["df"] is not None:
+                            st.dataframe(result["df"], use_container_width=True, hide_index=True)
+                        if result["sql"]:
+                            with st.expander("Ver SQL gerado"):
+                                st.code(result["sql"], language="sql")
+                except Exception as e:
+                    response_text = f"Erro ao comunicar com o Genie: {e}"
+                    st.error(response_text)
+                    result = {"df": None, "sql": None}
+
+        st.session_state.genie_messages.append({
+            "role": "assistant",
+            "content": response_text,
+            "df": result.get("df"),
+            "sql": result.get("sql"),
+        })
+
+    # Clear chat button
+    if st.session_state.genie_messages:
+        if st.button("🗑️ Limpar conversa", key="clear_genie"):
+            st.session_state.genie_messages = []
+            st.rerun()
